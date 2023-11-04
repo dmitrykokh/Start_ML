@@ -1,190 +1,124 @@
 import os
-from dotenv import load_dotenv
-import hashlib
-import pandas as pd
-from datetime import datetime
-from catboost import CatBoostClassifier
-from fastapi import Depends, FastAPI
-from schema import PostGet, Response
+from typing import List
+from fastapi import FastAPI
 from loguru import logger
+import pandas as pd
 from sqlalchemy import create_engine
+import os
+from catboost import CatBoostClassifier
+from datetime import datetime
+from schema import PostGet
+
 
 app = FastAPI()
 
-salt = "comparison of two models"
 
-
-def get_exp_group(user_id: int, salt: str = salt) -> str:
-    value_str = str(user_id) + salt
-    result = int(hashlib.md5(value_str.encode()).hexdigest(), 16) % 2
-    if result:
-        group = "test"
+# Load catboost_model
+def get_model_path(path: str) -> str:
+    print(os.environ)
+    if os.environ.get("IS_LMS") == "1":
+        model_path = '/workdir/user_input/model'
     else:
-        group = "control"
-    return group
+        model_path = path
+    return model_path
 
+
+def load_models():
+    model_path = get_model_path(
+        "catboost_model")
+    model = CatBoostClassifier().load_model(model_path, format='cbm')
+    return model
+
+
+model = load_models()
+
+
+### Load features from database
 
 def batch_load_sql(query: str) -> pd.DataFrame:
-    CHUNKSIZE = 200000
     engine = create_engine(
         "postgresql://robot-startml-ro:pheiph0hahj1Vaif@"
         "postgres.lab.karpov.courses:6432/startml"
     )
     conn = engine.connect().execution_options(stream_results=True)
     chunks = []
-    for chunk_dataframe in pd.read_sql(query, conn, chunksize=CHUNKSIZE):
+    for chunk_dataframe in pd.read_sql(query, conn, chunksize=200000):
         chunks.append(chunk_dataframe)
+        logger.info(f"Got chunk: {len(chunk_dataframe)}")
+        break
     conn.close()
     return pd.concat(chunks, ignore_index=True)
 
 
-def get_model_path(path: str) -> str:
-    if os.environ.get("IS_LMS") == "1":  # проверяем где выполняется код в лмс, или локально. Немного магии
-        MODEL_PATH = r'/workdir/user_input/' + path
-    else:
-        MODEL_PATH = path
-    return MODEL_PATH
+def load_features():
+    query1 = 'SELECT * FROM kokh_user_features_df'
+    query2 = 'SELECT * FROM kokh_post_features_df'
+    return batch_load_sql(query1), batch_load_sql(query2)
 
 
-def load_model(type_model: str):
-    if type_model == "control":
-        model_path = get_model_path("model_control")
-    elif type_model == "test":
-        model_path = get_model_path("model_test")
-    else:
-        raise ValueError('The param type_model may be value "control" or "test"')
-    model = CatBoostClassifier()
-    model.load_model(model_path)
-    return model
+df1, df2 = load_features()
 
 
-def load_features_user() -> pd.DataFrame:
-    df_user_data = batch_load_sql("""SELECT * FROM pavel55645_users_lesson_22""")
-    df_user_data = df_user_data.drop(['index'], axis=1)
-    return df_user_data
+### Load post_text_df dataframe
+
+def load_post_text_df() -> pd.DataFrame:
+    query = 'SELECT * FROM public.post_text_df'
+    return batch_load_sql(query)
 
 
-def load_features_post_control() -> pd.DataFrame:
-    df_post_data = batch_load_sql("""SELECT * FROM pavel55645_posts_info_lesson_22""")
-    df_post_data = df_post_data.drop(['index'], axis=1)
-    return df_post_data
+def load_post_texts(post_ids: List[int]) -> List[dict]:
+    global post_texts_df
+    if post_texts_df is None:
+        raise ValueError("First call load_post_texts_df().")
+    records_df = post_texts_df[post_texts_df['post_id'].isin(post_ids)]
+    return records_df.to_dict("records")
 
 
-def load_features_post_test() -> pd.DataFrame:
-    df_post_data = batch_load_sql("""SELECT * FROM pavel55645_posts_info_features_dl""")
-    df_post_data = df_post_data.drop(['index'], axis=1)
-    return df_post_data
+post_text_df = load_post_text_df()
 
 
-def load_liked_posts() -> pd.DataFrame:
-    logger.info("loading liked posts")
-    liked_posts_query = """
-        SELECT distinct post_id, user_id
-        FROM public.feed_data
-        WHERE action='like'
-        """
-    liked_posts = batch_load_sql(liked_posts_query)
-    return liked_posts
+### Function for prediction
+
+def prediction_top_5_posts(user_features_df, post_features_df, user_id, model):
+    ## Save the place for features is important for model
+    places_for_features_columns = ['user_id', 'post_id', 'gender', 'age', 'country', 'city',
+                                   'exp_group', 'os', 'source', 'count_actions', 'category_of_age',
+                                   'cluster_feature', 'month', 'day', 'second', 'weekday', 'is_weekend',
+                                   'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5',
+                                   'part_of_day', 'topic']
+
+    # Create copy of dataframes and find the data of this user
+    this_user_data = user_features_df.copy().loc[user_features_df['user_id'] == user_id]
+    all_post_features_df = post_features_df.copy()
+
+    # Merge dataframes on key column
+    this_user_data['key'] = 1
+    all_post_features_df['key'] = 1
+    result = this_user_data.merge(all_post_features_df, on='key').drop('key', axis=1)
+    result = result[places_for_features_columns].set_index(['user_id', 'post_id'])
+    result['prediction'] = model.predict_proba(result)[:, 1]
+    top_5_posts = result.sort_values('prediction', ascending=False).head(5).index.get_level_values('post_id').tolist()
+    return top_5_posts
 
 
-logger.info("loading control model")
-model_control = load_model("control")
+### Get 5 recommendation of post to user
+@app.get("/post/recommendations/", response_model=List[PostGet])
+def recommended_posts(
+        id: int,
+        time: datetime = datetime.now(),
+        limit: int = 10) -> List[PostGet]:
+    top_5_posts_ids = prediction_top_5_posts(df1, df2, id, model)
 
-logger.info("loading test model")
-model_test = load_model("test")
+    # Filter top 5 posts from post_texts_df DataFrame
+    posts = post_text_df[post_text_df['post_id'].isin(top_5_posts_ids)]
 
-logger.info("loading user features")
-df_user_data = load_features_user()
+    # Convert posts to list of dictionaries and ensure they match PostGet model
+    posts_list = []
+    for _, row in posts.iterrows():
+        post_dict = row.to_dict()
+        post_dict["id"] = post_dict.pop("post_id")
+        if "Unnamed: 0" in post_dict:
+            del post_dict["Unnamed: 0"]
+        posts_list.append(PostGet(**post_dict))
 
-logger.info("loading post control features")
-df_post_data_control = load_features_post_control()
-
-logger.info("loading post test features")
-df_post_data_test = load_features_post_test()
-
-logger.info("loading liked posts")
-liked_posts = load_liked_posts()
-
-logger.info("service is up and running")
-
-
-def get_recommended_feed(
-        id: int, time: datetime, limit: int,
-        df_user_data: pd.DataFrame = df_user_data,
-        df_post_data_control: pd.DataFrame = df_post_data_control,
-        df_post_data_test: pd.DataFrame = df_post_data_test,
-        liked_posts: pd.DataFrame = liked_posts,
-        model_control=model_control,
-        model_test=model_test):
-    logger.info(f"user_id: {id}")
-    # Получаем признаки пользователя
-    df_user_id = df_user_data.loc[df_user_data.user_id == id]
-    df_user_id = df_user_id.drop('user_id', axis=1)
-
-    group = get_exp_group(id)
-    logger.info(f"group: {group}")
-
-    # Выбираем признаки постов и модель в зависимости от группы
-    df_post_data = df_post_data_control if group == "control" else df_post_data_test
-    model = model_control if group == "control" else model_test
-
-    # Выбираем sel_posts с каждого топика
-    sel_posts = 100
-
-    # Определяем категории постов, где пользователь поставил наибольшее число лайков
-    user_topic = df_user_id[['business', 'covid', 'entertainment', 'movie', 'politics', 'sport', 'tech']]
-    user_topic = user_topic.iloc[0]
-
-    user_topic = user_topic.sort_values(ascending=False).iloc[:3].index.to_list()
-
-    post_ids = []
-    for utopic in user_topic:
-        ids = df_post_data[df_post_data['topic'] == utopic]['post_id'].iloc[:sel_posts].values
-        post_ids.extend(ids)
-
-    liked_posts_user = liked_posts[(liked_posts['post_id'].isin(post_ids)) & (liked_posts['user_id'] == id)]
-    liked_posts_ids = liked_posts_user['post_id'].values
-    # id шники постов, по которым будет вычислено предсказание
-    post_ids = list(set(post_ids) - set(liked_posts_ids))
-
-    # посты, по которым будет вычислено предсказание
-    logger.info("post columns")
-    post_candidate = df_post_data[df_post_data.post_id.isin(post_ids)]
-    posts_features = post_candidate.drop(['text'], axis=1)
-    content = post_candidate[['post_id', 'text', 'topic']]
-
-    logger.info("zipping everything")
-    add_user_features = dict(zip(df_user_id.columns, df_user_id.values[0]))
-
-    logger.info("assigning everything")
-    user_posts_features = posts_features.assign(**add_user_features)
-    user_posts_features = user_posts_features.set_index('post_id')
-
-    logger.info("add time info")
-    user_posts_features['hour'] = time.hour
-    user_posts_features['month'] = time.month
-
-    logger.info("predicting")
-
-    predicts = model.predict_proba(user_posts_features)[:, 1]
-    user_posts_features['predicts'] = predicts
-
-    logger.info("deleting liked posts")
-    liked_posts_ = liked_posts[liked_posts.user_id == id].post_id.values
-    filtered_ = user_posts_features[~user_posts_features.index.isin(liked_posts_)]
-    recomended_posts = filtered_.sort_values('predicts')[-limit:].index
-
-    return Response(
-        exp_group=group,
-        recommendations=[
-            PostGet(**{"id": i,
-                       "text": content[content.post_id == i].text.values[0],
-                       "topic": content[content.post_id == i].topic.values[0]})
-            for i in recomended_posts
-        ]
-    )
-
-
-@app.get("/post/recommendations/", response_model=Response)
-def recommended_posts(id: int, time: datetime, limit: int = 10) -> Response:
-    return get_recommended_feed(id, time, limit)
+    return posts_list

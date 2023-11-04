@@ -10,9 +10,8 @@ from schema import PostGet
 app = FastAPI()
 
 
-# Load catboost_model
 def get_model_path(path: str) -> str:
-    if os.environ.get("IS_LMS") == "1":  # Checking localhost or LMS service
+    if os.environ.get("IS_LMS") == "1":
         MODEL_PATH = '/workdir/user_input/model'
     else:
         MODEL_PATH = path
