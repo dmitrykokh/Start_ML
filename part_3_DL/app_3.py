@@ -1,119 +1,116 @@
-from typing import List
-from fastapi import FastAPI
-import pandas as pd
-from sqlalchemy import create_engine
 import os
-from catboost import CatBoostClassifier
+import pandas as pd
+from typing import List
 from datetime import datetime
+from catboost import CatBoostClassifier
+from fastapi import FastAPI
+from loguru import logger
 from schema import PostGet
+from sqlalchemy import create_engine
+
 
 app = FastAPI()
 
 
-def get_model_path(path: str) -> str:
-    if os.environ.get("IS_LMS") == "1":
-        MODEL_PATH = '/workdir/user_input/model'
-    else:
-        MODEL_PATH = path
-    return MODEL_PATH
-
-
-def load_models():
-    model_path = get_model_path(
-        "catboost_model")
-    model = CatBoostClassifier().load_model(model_path, format='cbm')
-    return model
-
-
-model = load_models()
-
-
-### Load features from database
-
-def batch_load_sql(query: str) -> pd.DataFrame:
-    CHUNKSIZE = 200000
+def batch_load_sql(query: str):
     engine = create_engine(
         "postgresql://robot-startml-ro:pheiph0hahj1Vaif@"
         "postgres.lab.karpov.courses:6432/startml"
     )
     conn = engine.connect().execution_options(stream_results=True)
     chunks = []
-    for chunk_dataframe in pd.read_sql(query, conn, chunksize=CHUNKSIZE):
+    for chunk_dataframe in pd.read_sql(query, conn, chunksize=200000):
         chunks.append(chunk_dataframe)
+        logger.info(f"Got chunk: {len(chunk_dataframe)}")
     conn.close()
     return pd.concat(chunks, ignore_index=True)
 
 
+def get_model_path(path: str) -> str:
+    if os.environ.get('IS_LMS') == '1':
+        model_path = f'/workdir/user_input/model'
+    else:
+        model_path = path
+    return model_path
+
+
 def load_features():
-    query1 = 'SELECT * FROM kokh_user_features_df'
-    query2 = 'SELECT * FROM kokh_post_features_df'
-    return batch_load_sql(query1), batch_load_sql(query2)
+    logger.info("loading liked posts")
+    liked_posts_query = """
+        SELECT distinct post_id, user_id
+        FROM public.feed_data
+        where action='like'"""
+    liked_posts = batch_load_sql(liked_posts_query)
+    logger.info("loading posts features")
+    posts_features = pd.read_sql(
+        """SELECT * FROM public.posts_info_features_dl""",
+        con="postgresql://robot-startml-ro:pheiph0hahj1Vaif@"
+            "postgres.lab.karpov.courses:6432/startml"
+    )
+    logger.info("loading user features")
+    user_features = pd.read_sql(
+        """SELECT * FROM public.user_data""",
+        con="postgresql://robot-startml-ro:pheiph0hahj1Vaif@"
+            "postgres.lab.karpov.courses:6432/startml"
+    )
+
+    return [liked_posts, posts_features, user_features]
 
 
-df1, df2 = load_features()
+def load_models():
+    model_path = get_model_path('model')
+    loaded_model = CatBoostClassifier()
+    loaded_model.load_model(model_path)
+    return loaded_model
 
 
-### Load post_text_df dataframe
-
-def load_post_text_df() -> pd.DataFrame:
-    query = 'SELECT * FROM public.post_text_df'
-    return batch_load_sql(query)
-
-
-def load_post_texts(post_ids: List[int]) -> List[dict]:
-    global post_texts_df
-    if post_texts_df is None:
-        raise ValueError("First call load_post_texts_df().")
-
-    records_df = post_texts_df[post_texts_df['post_id'].isin(post_ids)]
-    return records_df.to_dict("records")
+logger.info('loading model')
+model = load_models()
+logger.info('loading features')
+features = load_features()
+logger.info('service is up and running')
 
 
-post_text_df = load_post_text_df()
+def get_recommended_feed(id: int, time: datetime, limit: int):
+    logger.info(f'user id: {id}')
+    logger.info('reading features')
+    user_features = features[2].loc[features[2].user_id == id]
+    user_features = user_features.drop("user_id", axis=1)
+
+    logger.info("dropping columns")
+    posts_features = features[1].drop(["index", "text"], axis=1)
+    content = features[1][['post_id', 'text', 'topic']]
+
+    logger.info("zipping everything")
+    add_user_features = dict(zip(user_features.columns, user_features.values[0]))
+    logger.info("assigning everything")
+    user_posts_features = posts_features.assign(**add_user_features)
+    user_posts_features = user_posts_features.set_index("post_id")
+
+    logger.info("add time info")
+    user_posts_features["hour"] = time.hour
+    user_posts_features["month"] = time.month
+
+    logger.info("predicting")
+    predicts = model.predict_proba(user_posts_features)[:, 1]
+    user_posts_features["predicts"] = predicts
+
+    logger.info("deleting liked posts")
+    liked_posts = features[0]
+    liked_posts = liked_posts[liked_posts.user_id == id].post_id.values
+    filtered_ = user_posts_features[~user_posts_features.index.isin(liked_posts)]
+
+    recommended_posts = filtered_.sort_values("predicts")[-limit:].index
+
+    return [
+        PostGet(**{
+            'id': i,
+            'text': content[content.post_id == i].text.values[0],
+            'topic': content[content.post_id == i].topic.values[0]
+        }) for i in recommended_posts
+    ]
 
 
-### Function for prediction
-
-def prediction_top_5_posts(user_features_df, post_features_df, user_id, model):
-    ## Save the place for features is important for model
-    places_for_features_columns = ['user_id', 'post_id', 'gender', 'age', 'country', 'city',
-                                   'exp_group', 'os', 'source', 'count_actions', 'category_of_age',
-                                   'cluster_feature', 'month', 'day', 'second', 'weekday', 'is_weekend',
-                                   'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5',
-                                   'part_of_day', 'topic']
-
-    # Create copy of dataframes and find the data of this user
-    this_user_data = user_features_df.copy().loc[user_features_df['user_id'] == user_id]
-    all_post_features_df = post_features_df.copy()
-
-    # Merge dataframes on key column
-    this_user_data['key'] = 1
-    all_post_features_df['key'] = 1
-    result = this_user_data.merge(all_post_features_df, on='key').drop('key', axis=1)
-    result = result[places_for_features_columns].set_index(['user_id', 'post_id'])
-    result['prediction'] = model.predict_proba(result)[:, 1]
-    top_5_posts = result.sort_values('prediction', ascending=False).head(5).index.get_level_values('post_id').tolist()
-    return top_5_posts
-
-
-### Get 5 recommendation of post to user
 @app.get("/post/recommendations/", response_model=List[PostGet])
-def recommended_posts(
-        id: int,
-        time: datetime = datetime.now(),
-        limit: int = 10) -> List[PostGet]:
-    top_5_posts_ids = prediction_top_5_posts(df1, df2, id, model)
-
-    # Filter top 5 posts from post_texts_df DataFrame
-    posts = post_text_df[post_text_df['post_id'].isin(top_5_posts_ids)]
-
-    # Convert posts to list of dictionaries and ensure they match PostGet model
-    posts_list = []
-    for _, row in posts.iterrows():
-        post_dict = row.to_dict()
-        post_dict["id"] = post_dict.pop("post_id")
-        if "Unnamed: 0" in post_dict:
-            del post_dict["Unnamed: 0"]
-        posts_list.append(PostGet(**post_dict))
-
-    return posts_list
+def recommended_posts(id: int, time: datetime, limit: int = 10) -> List[PostGet]:
+    return get_recommended_feed(id, time, limit)
