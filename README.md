@@ -6,7 +6,7 @@ ___
 
 С точки зрения разработки, на протяжении четырёх частей курса реализовались сервисы, которые для каждого юзера в любой момент времени возвращали рекомендованные посты.
 ## Использованы библиотеки:
-* fastapi uvicorn sqlalchemy psycopg2 pandas numpy matplotlib seaborn pytorch catboost
+fastapi uvicorn sqlalchemy psycopg2 pandas numpy matplotlib seaborn pytorch catboost
 ## part_1
 В этой части разрабатывался сервис, который возвращает топ ```limit``` постов по количеству лайков.
 ## part_2
